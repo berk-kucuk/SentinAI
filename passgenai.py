@@ -1,15 +1,14 @@
 import json
+import os
 from datetime import datetime
-from utils import initialize_gemini 
+from utils import initialize_gemini, get_base_dir
 
-def passgen(user_input: str) -> str:
 
-    print("🤖 Hyper-Realistic PassGen Agent (AI Mode) running...")
+def passgen(user_input: str, model_name: str = None, progress_callback=None) -> list:
+    if progress_callback:
+        progress_callback("Initializing AI model...")
 
-    try:
-        model = initialize_gemini()
-    except Exception as e:
-        return str(e)
+    model = initialize_gemini(model_name)
 
     prompt = f"""
         [PERSONA]
@@ -57,35 +56,42 @@ def passgen(user_input: str) -> str:
         "{user_input}"
     """
 
+    if progress_callback:
+        progress_callback("Requesting password combinations from AI...")
+
+    response = model.generate_content(prompt)
+    response_text = response.text.strip()
+    clean_text = (
+        response_text
+        .removeprefix("```json")
+        .removeprefix("```")
+        .removesuffix("```")
+        .strip()
+    )
+
     try:
-        print("Requesting hyper-realistic password combinations from AI...")
-        response = model.generate_content(prompt)
-        
-        response_text = response.text.strip()
-        clean_text = response_text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-        
         data = json.loads(clean_text)
-        password_list = data.get("passwords", [])
-
-        if not password_list:
-            return "AI could not generate a wordlist with the provided info and constraints. Please change the details or length range."
-
     except json.JSONDecodeError:
-        return f"Error: Response from AI is not valid JSON. Response: {response.text}"
-    except Exception as e:
-        return f"Error: An issue occurred while communicating with the AI: {e}"
+        raise RuntimeError("AI returned invalid JSON. Please try again.")
 
-    try:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"wordlists/wordlist_{timestamp}.txt"
-        
-        with open(filename, "w", encoding="utf-8") as f:
-            for password in password_list:
-                f.write(f"{password}\n")
-        
-        success_message = f"Success! {len(password_list)} potential passwords generated and saved to '{filename}'."
-        print(success_message)
-        return success_message
-        
-    except Exception as e:
-        return f"Error: An issue occurred while writing to the file: {e}"
+    passwords = [str(p) for p in data.get("passwords", []) if p]
+
+    if not passwords:
+        raise RuntimeError(
+            "AI could not generate passwords with the given information and constraints. "
+            "Try providing more details or adjusting the length range."
+        )
+
+    base_dir = get_base_dir()
+    out_dir = os.path.join(base_dir, "wordlists")
+    os.makedirs(out_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = os.path.join(out_dir, f"wordlist_{timestamp}.txt")
+
+    with open(filename, "w", encoding="utf-8") as f:
+        f.writelines(f"{p}\n" for p in passwords)
+
+    if progress_callback:
+        progress_callback(f"Saved {len(passwords)} passwords → {os.path.basename(filename)}")
+
+    return passwords

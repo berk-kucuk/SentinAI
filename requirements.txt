@@ -1,6 +1,6 @@
-PyQt6
-google-generativeai
+google-genai
 python-dotenv
+PyQt6
 beautifulsoup4
 googlesearch-python
 selenium
