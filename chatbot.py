@@ -1,31 +1,84 @@
-# chatbot.py
+import requests
+from google import genai as _genai
+from google.genai import types as _types
 
-import google.generativeai as genai
+from utils import get_ollama_host, check_ollama_running
+
+SYSTEM_INSTRUCTION = (
+    "You are SentinAI, an expert cybersecurity assistant. "
+    "You have deep knowledge of: OSINT techniques, password security and authentication, "
+    "network security and penetration testing concepts, malware analysis and threat intelligence, "
+    "security frameworks (MITRE ATT&CK, NIST, ISO 27001), CTF challenges, and defensive security "
+    "best practices. Provide accurate, detailed, and practical guidance. Always emphasize ethical use. "
+    "When discussing offensive techniques, frame them in a defensive or authorized testing context."
+)
+
 
 class Chatbot:
+    """Backend-agnostic chat wrapper. Supports:
+      - backend="gemini": uses google-genai chat sessions (multi-turn, server-side history)
+      - backend="ollama": uses a local Ollama service's /api/chat endpoint,
+        with conversation history kept client-side.
+    """
 
-    def __init__(self, api_key: str, model_name: str = "gemini-1.5-flash"):
+    def __init__(
+        self,
+        backend: str = "gemini",
+        api_key: str = None,
+        model_name: str = None,
+        ollama_host: str = None,
+        timeout: int = 300,
+    ):
+        self.backend = (backend or "gemini").lower()
+        self._model_name = model_name
+        self._timeout = timeout
 
-        if not api_key:
-            raise ValueError("API anahtarı boş olamaz. Lütfen bir API anahtarı sağlayın.")
-            
-        try:
-            genai.configure(api_key=api_key)
-            self.model = genai.GenerativeModel(model_name)
-            self.chat = self.model.start_chat(history=[])
-            print(f"✅ Standart Chatbot, '{model_name}' modeli ile başarıyla başlatıldı.")
-        except Exception as e:
-            print(f"❌ Chatbot başlatılırken bir hata oluştu: {e}")
-            raise
+        if self.backend == "ollama":
+            self._ollama_host = (ollama_host or get_ollama_host()).rstrip("/")
+            if not model_name:
+                raise ValueError("No Ollama model selected. Please choose one in Settings.")
+            if not check_ollama_running(self._ollama_host):
+                raise RuntimeError(
+                    f"Ollama service not reachable at {self._ollama_host}. "
+                    "Make sure `ollama serve` is running."
+                )
+            self._messages = [{"role": "system", "content": SYSTEM_INSTRUCTION}]
+        else:
+            if not api_key:
+                raise ValueError("API key cannot be empty.")
+            self._client = _genai.Client(api_key=api_key)
+            self._config = _types.GenerateContentConfig(system_instruction=SYSTEM_INSTRUCTION)
+            self.chat = self._client.chats.create(model=self._model_name, config=self._config)
 
     def send_message(self, message: str) -> str:
-
         if not message.strip():
-            return "Lütfen bir mesaj girin."
-            
-        try:
-            response = self.chat.send_message(message)
-            return response.text
-        except Exception as e:
-            print(f"❌ Mesaj gönderilirken bir hata oluştu: {e}")
-            return "Üzgünüm, bir sorunla karşılaştım. Lütfen daha sonra tekrar deneyin."
+            return ""
+
+        if self.backend == "ollama":
+            self._messages.append({"role": "user", "content": message})
+            try:
+                resp = requests.post(
+                    f"{self._ollama_host}/api/chat",
+                    json={
+                        "model": self._model_name,
+                        "messages": self._messages,
+                        "stream": False,
+                    },
+                    timeout=self._timeout,
+                )
+                resp.raise_for_status()
+            except requests.exceptions.RequestException as e:
+                raise RuntimeError(f"Ollama servisine ulaşılamadı ({self._ollama_host}): {e}")
+            data = resp.json()
+            reply = (data.get("message") or {}).get("content", "")
+            self._messages.append({"role": "assistant", "content": reply})
+            return reply
+
+        response = self.chat.send_message(message)
+        return response.text
+
+    def clear_history(self):
+        if self.backend == "ollama":
+            self._messages = [{"role": "system", "content": SYSTEM_INSTRUCTION}]
+        else:
+            self.chat = self._client.chats.create(model=self._model_name, config=self._config)

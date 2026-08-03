@@ -8,9 +8,9 @@ class SimpleSwitch(QCheckBox):
         self.setFixedSize(50, 24)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
-        self._off_color = QColor("#cccccc")
-        self._on_color = QColor("#4c8be8")
-        self._knob_color = QColor("#ffffff")
+        self._off_color = QColor("#2a2a2e")
+        self._on_color = QColor("#3b82f6")
+        self._knob_color = QColor("#e8eaed")
 
         self.stateChanged.connect(self.update)
 
@@ -20,7 +20,7 @@ class SimpleSwitch(QCheckBox):
         painter.setPen(Qt.PenStyle.NoPen)
 
         rect = QRectF(0, 0, self.width(), self.height())
-        
+
         bg_color = self._on_color if self.isChecked() else self._off_color
         painter.setBrush(QBrush(bg_color))
         painter.drawRoundedRect(rect, self.height() / 2, self.height() / 2)
@@ -30,7 +30,7 @@ class SimpleSwitch(QCheckBox):
             knob_x = self.width() - knob_radius - 3
         else:
             knob_x = 3
-        
+
         knob_rect = QRectF(knob_x, 3, knob_radius, knob_radius)
         painter.setBrush(QBrush(self._knob_color))
         painter.drawEllipse(knob_rect)
