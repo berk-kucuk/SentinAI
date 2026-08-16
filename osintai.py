@@ -28,6 +28,17 @@ _TR_MAP = str.maketrans({
     "ö": "o", "Ö": "o", "ş": "s", "Ş": "s", "ü": "u", "Ü": "u",
 })
 
+# Phrases that signal we hit a bot-wall / login-wall / JS-shell rather than
+# real content — very common on LinkedIn, Facebook, Instagram, Twitter/X
+# when fetched without a logged-in browser session.
+_BLOCK_SIGNS = [
+    "log in to continue", "you must log in", "please log in", "giriş yapmalısınız",
+    "giriş yap", "oturum açın", "sign up to see", "kaydolarak", "javascript is not available",
+    "enable javascript", "javascript'i etkinleştir", "checking your browser",
+    "verify you are a human", "access denied", "erişim engellendi", "403 forbidden",
+    "captcha", "are you a robot", "this content isn't available", "içerik şu anda kullanılamıyor",
+]
+
 
 # ── Browser fallback (used only when a static fetch isn't enough) ───────────
 def get_webdriver():
@@ -87,9 +98,6 @@ def extract_entities_with_ai(user_input: str, model) -> dict:
 
 # ── Username-guessing (no AI needed — fast, deterministic, cheap) ───────────
 def generate_username_candidates(full_name: str, max_candidates: int = 8) -> list:
-    """Realistic username permutations from a full name, the same way a
-    person would actually pick a handle. Lets the tool find profiles even
-    when the user never gave a username."""
     if not full_name:
         return []
     ascii_name = full_name.translate(_TR_MAP).lower()
@@ -120,8 +128,6 @@ def generate_username_candidates(full_name: str, max_candidates: int = 8) -> lis
 
 
 def check_github_username(username: str):
-    """GitHub's REST API gives a clean, deterministic 200/404 — no scraping,
-    no false positives from SPA shells."""
     try:
         r = requests.get(
             f"https://api.github.com/users/{username}",
@@ -136,24 +142,73 @@ def check_github_username(username: str):
     return None
 
 
-def probe_username_candidates(candidates: list, progress_callback=None, max_workers: int = 6) -> list:
-    """Directly checks GitHub for each candidate handle. Confirmed hits are
-    deterministic — no AI classification needed for these."""
+def check_reddit_username(username: str):
+    """Reddit's JSON API is clean and deterministic — no scraping needed."""
+    try:
+        r = requests.get(
+            f"https://www.reddit.com/user/{username}/about.json",
+            headers=_HTTP_HEADERS, timeout=6,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            if (data.get("data") or {}).get("name"):
+                return f"https://www.reddit.com/user/{username}"
+    except (requests.exceptions.RequestException, ValueError):
+        pass
+    return None
+
+
+def check_keybase_username(username: str):
+    """Keybase's lookup API is public and deterministic; also surfaces any
+    other platforms (Twitter, GitHub, HN, etc.) the person has proven
+    ownership of, which is genuinely high-value corroborating evidence."""
+    try:
+        r = requests.get(
+            "https://keybase.io/_/api/1.0/user/lookup.json",
+            params={"usernames": username}, timeout=6,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            them = data.get("them") or []
+            if them and them[0]:
+                return f"https://keybase.io/{username}"
+    except (requests.exceptions.RequestException, ValueError):
+        pass
+    return None
+
+
+_USERNAME_CHECKERS = [
+    ("GitHub", check_github_username, 95),
+    ("Reddit", check_reddit_username, 88),
+    ("Keybase", check_keybase_username, 88),
+]
+
+
+def probe_username_candidates(candidates: list, progress_callback=None, max_workers: int = 8) -> list:
+    """Checks every username candidate against several platforms with clean,
+    deterministic APIs (no scraping/false-positive risk). Confirmed hits
+    skip AI verification entirely."""
     confirmed = []
     if not candidates:
         return confirmed
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(check_github_username, c): c for c in candidates}
+        futures = {}
+        for c in candidates:
+            for platform, checker, conf in _USERNAME_CHECKERS:
+                futures[executor.submit(checker, c)] = (c, platform, conf)
         for future in as_completed(futures):
-            candidate = futures[future]
+            candidate, platform, conf = futures[future]
             try:
                 url = future.result()
                 if url:
-                    confirmed.append({"url": url, "verification_status": "Confirmed_Profile",
-                                       "confidence": 95, "source": "github_api_username_guess"})
+                    confirmed.append({
+                        "url": url, "verification_status": "Confirmed_Profile",
+                        "confidence": conf, "source": f"{platform.lower()}_api_username_guess",
+                        "matched_on": ["username"], "evidence_source": f"{platform}_api",
+                    })
                     if progress_callback:
-                        progress_callback(f"GitHub'da kullanıcı adı eşleşmesi bulundu: {candidate}")
+                        progress_callback(f"{platform}'da kullanıcı adı eşleşmesi bulundu: {candidate}")
             except Exception:
                 pass
     return confirmed
@@ -174,25 +229,30 @@ def normalize_url(url: str) -> str:
         return url
 
 
-def dedupe_urls(urls: list) -> list:
-    seen = set()
-    result = []
-    for u in urls:
-        if not u:
+def merge_search_hits(hits: list) -> dict:
+    """Merge hits (dicts with url/title/snippet/engine/query) from multiple
+    engines into one record per normalized URL, keeping the richest title
+    and snippet seen for it."""
+    merged = {}
+    for hit in hits:
+        url = hit.get("url")
+        if not url:
             continue
-        key = normalize_url(u)
-        if key not in seen:
-            seen.add(key)
-            result.append(u)
-    return result
+        key = normalize_url(url)
+        entry = merged.setdefault(key, {"url": url, "title": "", "snippet": "", "engines": set(), "query": ""})
+        if len(hit.get("title", "")) > len(entry["title"]):
+            entry["title"] = hit.get("title", "")
+        if len(hit.get("snippet", "")) > len(entry["snippet"]):
+            entry["snippet"] = hit.get("snippet", "")
+        if hit.get("engine"):
+            entry["engines"].add(hit["engine"])
+        if hit.get("query") and not entry["query"]:
+            entry["query"] = hit["query"]
+    return merged
 
 
 # ── Static fetch + hybrid verification with confidence scoring ──────────────
 def _fetch_static(url: str, timeout: int = 10):
-    """Fast, browser-less fetch. Covers the large majority of pages (news
-    sites, blogs, GitHub, public LinkedIn/Facebook snapshots, forums,
-    government/company pages, PDFs served as HTML, etc.) with no local
-    Chrome/Firefox install required."""
     try:
         resp = requests.get(url, headers=_HTTP_HEADERS, timeout=timeout, allow_redirects=True)
         if resp.status_code >= 400:
@@ -203,29 +263,62 @@ def _fetch_static(url: str, timeout: int = 10):
         return None
 
 
+def fetch_wayback_snapshot(url: str, timeout: int = 8):
+    """Checks the Wayback Machine for an archived snapshot of the page.
+    Genuinely useful when the live page is behind a bot/login wall: the
+    archived copy is often a real, previously-crawled version of the page
+    with the actual profile content intact — a standard professional OSINT
+    technique for reaching content that blocks live automated fetches."""
+    try:
+        r = requests.get(
+            "https://archive.org/wayback/available",
+            params={"url": url}, timeout=timeout,
+        )
+        r.raise_for_status()
+        data = r.json()
+        snap = (data.get("archived_snapshots") or {}).get("closest")
+        if snap and snap.get("available") and snap.get("url"):
+            return _fetch_static(snap["url"], timeout=timeout)
+    except (requests.exceptions.RequestException, ValueError):
+        pass
+    return None
+
+
 def _name_tokens(full_name: str) -> list:
     if not full_name:
         return []
     return [t for t in re.findall(r"\w+", full_name.lower()) if len(t) > 1]
 
 
-def verify_profile_existence(url: str, model, target_name: str = None, city: str = None, keywords: list = None) -> dict:
-    """Hybrid verification pipeline:
+def _looks_blocked(text: str) -> bool:
+    low = text.lower()
+    return any(sign in low for sign in _BLOCK_SIGNS)
+
+
+def verify_profile_existence(
+    url: str, model, target_name: str = None, city: str = None, keywords: list = None,
+    title_hint: str = "", snippet_hint: str = "", matched_query: str = "", engine_count: int = 1,
+) -> dict:
+    """Hybrid, snippet-aware verification pipeline:
       1. Fetch statically (fast, no browser needed).
       2. Escalate to a headless browser only if content is too thin AND a
-         driver is actually available — a missing browser never silently
-         drops a URL anymore.
-      3. Cheap relevance pre-filter: if NONE of the person's name tokens
-         appear anywhere on the page, skip the AI call entirely.
-      4. AI classification now returns a confidence score, not just a
-         keyword, to guard against common-name false positives.
+         driver is actually available.
+      3. If that still looks blocked (bot/login wall — common on LinkedIn,
+         Facebook, Instagram, Twitter/X without an authenticated session),
+         check the Wayback Machine for an archived snapshot before giving up
+         — this often recovers real, previously-crawled page content.
+      4. If even that fails, fall back to the search engine's own
+         title+snippet as evidence rather than discarding the URL.
+      5. AI classification returns a confidence score and is told exactly
+         which evidence tier it's working from, plus whether multiple
+         independent search engines corroborated this URL.
     """
     page_source = _fetch_static(url)
-    text_len = 0
+    page_text = ""
     if page_source:
-        text_len = len(BeautifulSoup(page_source, "html.parser").get_text(strip=True))
+        page_text = BeautifulSoup(page_source, "html.parser").get_text(separator=" ", strip=True)
 
-    if text_len < 200:
+    if len(page_text) < 200:
         driver = get_webdriver()
         if driver:
             try:
@@ -246,55 +339,100 @@ def verify_profile_existence(url: str, model, target_name: str = None, city: str
                         pass
                 rendered = driver.page_source
                 if rendered:
-                    page_source = rendered
+                    rendered_text = BeautifulSoup(rendered, "html.parser").get_text(separator=" ", strip=True)
+                    if len(rendered_text) > len(page_text):
+                        page_text = rendered_text
             except Exception:
                 pass
             finally:
                 driver.quit()
 
-    if not page_source:
-        return {"status": "NO_CONTENT_FOUND", "confidence": 0}
+    live_fetch_ok = len(page_text) >= 200 and not _looks_blocked(page_text)
+    evidence = "full_page" if live_fetch_ok else None
 
-    soup = BeautifulSoup(page_source, "html.parser")
-    page_text = soup.get_text(separator=" ", strip=True)
-    if not page_text:
-        return {"status": "NO_TEXT_FOUND", "confidence": 0}
+    # Escalate to an archived snapshot before falling back to snippet-only.
+    if not live_fetch_ok:
+        archived_html = fetch_wayback_snapshot(url)
+        if archived_html:
+            archived_text = BeautifulSoup(archived_html, "html.parser").get_text(separator=" ", strip=True)
+            if len(archived_text) >= 200 and not _looks_blocked(archived_text):
+                page_text = archived_text
+                live_fetch_ok = True
+                evidence = "wayback_archive"
 
-    # Cheap relevance gate — avoids wasting an AI call (and avoids false
-    # positives) on pages that don't mention the person at all.
     tokens = _name_tokens(target_name)
-    lower_text = page_text.lower()
-    if tokens and not any(tok in lower_text for tok in tokens):
-        return {"status": "GENERIC_ERROR", "confidence": 0}
+    combined_hint_text = f"{title_hint} {snippet_hint}".lower()
 
-    truncated = page_text[:4000]
+    if not live_fetch_ok and not title_hint and not snippet_hint:
+        return {"status": "NO_CONTENT_FOUND", "confidence": 0, "matched_on": [], "evidence": "none"}
+
+    if tokens:
+        text_has_name = any(tok in page_text.lower() for tok in tokens)
+        hint_has_name = any(tok in combined_hint_text for tok in tokens)
+        if not text_has_name and not hint_has_name:
+            return {"status": "GENERIC_ERROR", "confidence": 0, "matched_on": [], "evidence": "none"}
+
+    if live_fetch_ok:
+        evidence_text = page_text[:4000]
+    else:
+        evidence = "search_snippet_only"
+        evidence_text = f"Title: {title_hint}\nSnippet: {snippet_hint}"
+
+    corroboration_note = (
+        f"This URL was independently returned by {engine_count} different search engines, "
+        "which is a moderately strong signal that it's a real, consistently indexed page."
+        if engine_count >= 2 else
+        "This URL was returned by a single search engine."
+    )
+
+    evidence_source_desc = {
+        "full_page": "The FULL PAGE content was retrieved successfully.",
+        "wayback_archive": (
+            "The live page was blocked (login/JS wall), so an ARCHIVED SNAPSHOT from the Wayback "
+            "Machine was used instead. This is real, previously-crawled page content — treat it with "
+            "similar confidence to a full page read, noting it may be somewhat dated."
+        ),
+        "search_snippet_only": (
+            "The live page could not be retrieved directly (likely a login/JS wall — common for social "
+            "platforms without an authenticated session), and no archived snapshot was available. The "
+            "evidence below is the SEARCH ENGINE's own indexed title and snippet for this URL. Treat this "
+            "as slightly less certain than a full page read, but don't dismiss it just because the full "
+            "page wasn't accessible to you."
+        ),
+    }[evidence]
+
     verification_prompt = f"""
         [TASK]
-        Analyze the webpage text below and decide whether it genuinely belongs to / is meaningfully
-        about a SPECIFIC person, given the target details.
+        Decide whether the evidence below genuinely belongs to / is meaningfully about a SPECIFIC person.
 
         [TARGET DETAILS]
         - Full name: {target_name or "unknown"}
         - City: {city or "unknown"}
         - Other known details: {keywords or []}
 
-        [RULES]
-        - VALID_PROFILE: the page is a profile, bio, article, or document that is genuinely about this
-          specific person (matches name plus at least one other detail like city/profession/school, OR
-          is an unambiguous, low-collision name match).
-        - NOT_FOUND: explicit error messages like 'page not found', 'user does not exist', '404',
-          'this account doesn't exist', 'profile is private'.
-        - GENERIC_ERROR: a real page, but NOT about this specific person — a different person who
-          happens to share the name, a login screen, cookie wall, homepage, or unrelated content.
+        [EVIDENCE SOURCE]
+        {evidence_source_desc}
+        {corroboration_note}
+        This URL was returned by a search engine for the query: "{matched_query or "N/A"}"
 
-        [PAGE TEXT]
-        "{truncated}"
+        [EVIDENCE]
+        {evidence_text}
+
+        [RULES]
+        - VALID_PROFILE: this is a profile, bio, article, or document genuinely about this specific
+          person (name matches, plus ideally at least one other detail like city/profession/school —
+          but an unambiguous, low-collision full-name match on a personal profile URL is enough on its
+          own, especially for evidence from search_snippet_only).
+        - NOT_FOUND: explicit error signals — 'page not found', 'user does not exist', '404',
+          'account doesn't exist', 'profile is private'.
+        - GENERIC_ERROR: real evidence, but NOT about this specific person — a different person sharing
+          the name, a generic homepage, or unrelated content.
 
         [OUTPUT FORMAT]
         Respond with ONLY a single valid JSON object, no markdown:
         {{"status": "VALID_PROFILE" | "NOT_FOUND" | "GENERIC_ERROR",
-          "confidence": <integer 0-100, how sure you are this page is genuinely about the target>,
-          "matched_on": ["short list of which target details this page actually confirms"]}}
+          "confidence": <integer 0-100>,
+          "matched_on": ["short list of which target details this evidence actually confirms"]}}
     """
     try:
         ai_response = model.generate_content(verification_prompt)
@@ -302,18 +440,21 @@ def verify_profile_existence(url: str, model, target_name: str = None, city: str
         result = json.loads(clean)
         result.setdefault("confidence", 0)
         result.setdefault("matched_on", [])
+        if result.get("status") == "VALID_PROFILE" and engine_count >= 2:
+            bonus = 5 if engine_count == 2 else 10
+            result["confidence"] = min(100, result["confidence"] + bonus)
+        result["evidence"] = evidence
         return result
     except Exception:
-        # Fall back to a plain keyword read if the model didn't return valid JSON
         try:
             text = ai_response.text.strip().upper()
             if "VALID" in text:
-                return {"status": "VALID_PROFILE", "confidence": 60, "matched_on": []}
+                return {"status": "VALID_PROFILE", "confidence": 50, "matched_on": [], "evidence": evidence}
             if "NOT_FOUND" in text:
-                return {"status": "NOT_FOUND", "confidence": 0, "matched_on": []}
+                return {"status": "NOT_FOUND", "confidence": 0, "matched_on": [], "evidence": evidence}
         except Exception:
             pass
-        return {"status": "UNKNOWN_ERROR", "confidence": 0, "matched_on": []}
+        return {"status": "UNKNOWN_ERROR", "confidence": 0, "matched_on": [], "evidence": evidence}
 
 
 def run_social_analyzer(username: str) -> dict:
@@ -334,9 +475,6 @@ def run_social_analyzer(username: str) -> dict:
 
 # ── Search dorks (Google + Bing + DuckDuckGo, run concurrently) ─────────────
 def build_dork_queries(full_name: str, city: str = None, keywords: list = None) -> list:
-    """Broad set of dork queries. Works with just a full name + city
-    (no username required). Mixes precise (quoted, site:-filtered) queries
-    with a couple of looser ones for recall."""
     if not full_name:
         return []
 
@@ -369,8 +507,6 @@ def build_dork_queries(full_name: str, city: str = None, keywords: list = None) 
     if city:
         queries.append(f'{base} "{city}" haber OR "basın" OR news')
 
-    # Loose (unquoted) variant for extra recall — catches pages where the
-    # name appears with different word order/spacing than an exact quote.
     if city:
         queries.append(f'{full_name} {city}')
     else:
@@ -386,48 +522,72 @@ def build_dork_queries(full_name: str, city: str = None, keywords: list = None) 
 
 
 def run_google_dorks(queries: list, num_results: int = 8, progress_callback=None) -> list:
-    all_urls = []
+    hits = []
     for i, query in enumerate(queries):
-        try:
-            results = list(search(query, num_results=num_results, lang="tr"))
-            all_urls.extend(results)
+        results = None
+        for attempt in range(2):
+            try:
+                results = list(search(query, num_results=num_results, lang="tr", advanced=True))
+                break
+            except Exception:
+                if attempt == 0:
+                    time.sleep(random.uniform(2.0, 3.5))
+        if results:
+            for r in results:
+                hits.append({"url": r.url, "title": r.title or "", "snippet": r.description or "",
+                              "engine": "google", "query": query})
             if progress_callback:
                 progress_callback(f"Google [{i + 1}/{len(queries)}]: '{query[:60]}' → {len(results)} sonuç")
-        except Exception:
-            if progress_callback:
-                progress_callback(f"Google [{i + 1}/{len(queries)}]: '{query[:60]}' → engellendi, devam ediliyor")
+        elif progress_callback:
+            progress_callback(f"Google [{i + 1}/{len(queries)}]: '{query[:60]}' → engellendi, devam ediliyor")
         time.sleep(random.uniform(1.2, 2.5))
-    return dedupe_urls(all_urls)
+    return hits
 
 
 def run_bing_dorks(queries: list, num_results: int = 8, progress_callback=None) -> list:
-    all_urls = []
+    hits = []
     for i, query in enumerate(queries):
-        try:
-            resp = requests.get(
-                "https://www.bing.com/search",
-                params={"q": query, "count": num_results},
-                headers=_HTTP_HEADERS,
-                timeout=10,
-            )
-            resp.raise_for_status()
-            soup = BeautifulSoup(resp.text, "html.parser")
-            links = [a.get("href") for a in soup.select("li.b_algo h2 a") if a.get("href", "").startswith("http")]
-            all_urls.extend(links[:num_results])
-            if progress_callback:
-                progress_callback(f"Bing [{i + 1}/{len(queries)}]: '{query[:60]}' → {len(links)} sonuç")
-        except Exception:
-            if progress_callback:
-                progress_callback(f"Bing [{i + 1}/{len(queries)}]: '{query[:60]}' → hata, devam ediliyor")
+        resp = None
+        for attempt in range(2):
+            try:
+                resp = requests.get(
+                    "https://www.bing.com/search",
+                    params={"q": query, "count": num_results},
+                    headers=_HTTP_HEADERS,
+                    timeout=10,
+                )
+                resp.raise_for_status()
+                break
+            except Exception:
+                resp = None
+                if attempt == 0:
+                    time.sleep(random.uniform(1.5, 2.5))
+        if resp is not None:
+            try:
+                soup = BeautifulSoup(resp.text, "html.parser")
+                count = 0
+                for li in soup.select("li.b_algo")[:num_results]:
+                    a = li.select_one("h2 a")
+                    if not a or not a.get("href", "").startswith("http"):
+                        continue
+                    caption = li.select_one(".b_caption p") or li.select_one(".b_caption")
+                    snippet = caption.get_text(" ", strip=True) if caption else ""
+                    hits.append({"url": a["href"], "title": a.get_text(" ", strip=True), "snippet": snippet,
+                                 "engine": "bing", "query": query})
+                    count += 1
+                if progress_callback:
+                    progress_callback(f"Bing [{i + 1}/{len(queries)}]: '{query[:60]}' → {count} sonuç")
+            except Exception:
+                if progress_callback:
+                    progress_callback(f"Bing [{i + 1}/{len(queries)}]: '{query[:60]}' → ayrıştırma hatası")
+        elif progress_callback:
+            progress_callback(f"Bing [{i + 1}/{len(queries)}]: '{query[:60]}' → hata, devam ediliyor")
         time.sleep(random.uniform(0.8, 1.6))
-    return dedupe_urls(all_urls)
+    return hits
 
 
 def run_duckduckgo_dorks(queries: list, num_results: int = 8, progress_callback=None) -> list:
-    """DuckDuckGo's HTML endpoint is not JS-rendered and is far less
-    aggressive about blocking automated queries than Google, making it a
-    reliable third source."""
-    all_urls = []
+    hits = []
     for i, query in enumerate(queries):
         try:
             resp = requests.get(
@@ -438,55 +598,65 @@ def run_duckduckgo_dorks(queries: list, num_results: int = 8, progress_callback=
             )
             resp.raise_for_status()
             soup = BeautifulSoup(resp.text, "html.parser")
-            links = []
-            for a in soup.select("a.result__a")[:num_results]:
+            count = 0
+            for result in soup.select(".result")[:num_results]:
+                a = result.select_one("a.result__a")
+                if not a:
+                    continue
                 href = a.get("href")
                 if not href:
                     continue
                 if "uddg=" in href:
                     qs = parse_qs(urlparse(href).query)
                     real = qs.get("uddg", [None])[0]
-                    if real:
-                        links.append(unquote(real))
-                elif href.startswith("http"):
-                    links.append(href)
-            all_urls.extend(links)
+                    href = unquote(real) if real else None
+                if not href or not href.startswith("http"):
+                    continue
+                snippet_el = result.select_one("a.result__snippet") or result.select_one(".result__snippet")
+                snippet = snippet_el.get_text(" ", strip=True) if snippet_el else ""
+                hits.append({"url": href, "title": a.get_text(" ", strip=True), "snippet": snippet,
+                             "engine": "duckduckgo", "query": query})
+                count += 1
             if progress_callback:
-                progress_callback(f"DuckDuckGo [{i + 1}/{len(queries)}]: '{query[:60]}' → {len(links)} sonuç")
+                progress_callback(f"DuckDuckGo [{i + 1}/{len(queries)}]: '{query[:60]}' → {count} sonuç")
         except Exception:
             if progress_callback:
                 progress_callback(f"DuckDuckGo [{i + 1}/{len(queries)}]: '{query[:60]}' → hata, devam ediliyor")
         time.sleep(random.uniform(0.6, 1.4))
-    return dedupe_urls(all_urls)
+    return hits
 
 
-def run_all_dorks(queries: list, progress_callback=None) -> list:
-    """Runs Google, Bing, and DuckDuckGo concurrently (they're independent
-    services, so one being rate-limited doesn't slow down the others)."""
+def run_all_dorks(queries: list, progress_callback=None) -> dict:
+    """Runs Google, Bing, and DuckDuckGo concurrently and returns a merged
+    {normalized_url: {url, title, snippet, engines, query}} dict."""
     engines = [run_google_dorks, run_bing_dorks, run_duckduckgo_dorks]
-    all_urls = []
+    all_hits = []
     with ThreadPoolExecutor(max_workers=len(engines)) as executor:
         futures = [executor.submit(engine, queries, 8, progress_callback) for engine in engines]
         for future in as_completed(futures):
             try:
-                all_urls.extend(future.result())
+                all_hits.extend(future.result())
             except Exception:
                 pass
-    return dedupe_urls(all_urls)
+    return merge_search_hits(all_hits)
 
 
 def verify_urls_parallel(
-    urls: list, model, target_name: str = None, city: str = None, keywords: list = None,
-    progress_callback=None, max_workers: int = 5, min_confidence: int = 55,
+    merged_hits: dict, model, target_name: str = None, city: str = None, keywords: list = None,
+    progress_callback=None, max_workers: int = 5, min_confidence: int = 40,
 ) -> list:
     verified = []
-    total = len(urls)
+    total = len(merged_hits)
     completed = 0
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
-            executor.submit(verify_profile_existence, url, model, target_name, city, keywords): url
-            for url in urls
+            executor.submit(
+                verify_profile_existence, entry["url"], model, target_name, city, keywords,
+                entry.get("title", ""), entry.get("snippet", ""), entry.get("query", ""),
+                max(1, len(entry.get("engines", set()))),
+            ): entry["url"]
+            for entry in merged_hits.values()
         }
         for future in as_completed(futures):
             url = futures[future]
@@ -497,11 +667,14 @@ def verify_urls_parallel(
             try:
                 result = future.result()
                 if result.get("status") == "VALID_PROFILE" and result.get("confidence", 0) >= min_confidence:
+                    key = normalize_url(url)
                     verified.append({
                         "url": url,
                         "verification_status": "Confirmed_Profile",
                         "confidence": result.get("confidence", 0),
                         "matched_on": result.get("matched_on", []),
+                        "evidence_source": result.get("evidence", "unknown"),
+                        "sources": sorted(merged_hits.get(key, {}).get("engines", set())),
                     })
             except Exception:
                 pass
@@ -516,6 +689,7 @@ def analyze_fused_data_with_ai(
     keywords: list,
     model,
     language_code: str,
+    methodology: list = None,
 ) -> str:
     LANG_MAP = {
         "en": "English",
@@ -523,6 +697,7 @@ def analyze_fused_data_with_ai(
         "ru": "Russian (Русский)",
     }
     language_name = LANG_MAP.get(language_code, "English")
+    methodology = methodology or []
 
     prompt = f"""
         [REPORT LANGUAGE]
@@ -535,18 +710,19 @@ def analyze_fused_data_with_ai(
 
         [PRIMARY TASK]
         Produce an exhaustive intelligence profile from all data below. Each item includes a confidence
-        score (0-100) and the specific details it matched on — use these to calibrate how confidently you
-        state each finding, and call out lower-confidence items as tentative / needing manual review.
+        score (0-100), which sources/engines independently corroborated it, and whether it came from a
+        full page read, an archived snapshot, or a search-engine snippet only — use these to calibrate
+        how confidently you state each finding.
         1. Synthesize ALL data points. Do not omit details.
         2. Correlate information. State connections between different accounts explicitly.
         3. Provide Direct Evidence. Include source links for every profile or document mentioned.
         4. Incorporate initial keywords into your analysis.
-        5. Flag any items with confidence below 70 as "needs manual verification" rather than stating
-           them as fact.
+        5. Flag any items with confidence below 60 as "needs manual verification" rather than fact.
 
         [INITIAL CONTEXT]
         - Original User Request: "{user_input}"
         - Extracted Keywords: {keywords}
+        - Sources/tools used in this investigation: {methodology}
 
         [VERIFIED OSINT DATA] (sorted by confidence, highest first)
         {json.dumps(verified_data, indent=2, ensure_ascii=False)}
@@ -556,27 +732,33 @@ def analyze_fused_data_with_ai(
 
         # Intelligence Profile: [Target's Inferred Full Name]
 
-        ## 1. Executive Summary
+        ## 1. Methodology
+        Briefly list which sources/tools were used for this investigation (from the list above) and
+        how confidence scores should be interpreted (full page > archived snapshot > search snippet only;
+        corroboration by multiple independent sources increases confidence).
+
+        ## 2. Executive Summary
         One-paragraph overview of the target's digital identity, primary activities, and key characteristics.
 
-        ## 2. Detailed Findings & Evidence
+        ## 3. Detailed Findings & Evidence
 
-        ### 2.1. Verified Professional & Technical Profiles
-        Analyze profiles from GitHub, LinkedIn, etc. Include confidence for each.
-        - **[Platform]:** [URL] — Confidence: [X]% — [Detailed analysis]
+        ### 3.1. Verified Professional & Technical Profiles
+        Analyze profiles from GitHub, LinkedIn, Reddit, Keybase, etc. Include confidence and corroborating
+        sources for each.
+        - **[Platform]:** [URL] — Confidence: [X]% — Corroborated by: [sources] — [Detailed analysis]
 
-        ### 2.2. Verified Social Media Presence
+        ### 3.2. Verified Social Media Presence
         Analyze confirmed accounts from Facebook, Instagram, Twitter/X, etc. Include confidence for each.
-        - **[Platform]:** [URL] — Confidence: [X]% — [Detailed analysis]
+        - **[Platform]:** [URL] — Confidence: [X]% — Corroborated by: [sources] — [Detailed analysis]
 
-        ### 2.3. Verified Public Documents & Footprints
+        ### 3.3. Verified Public Documents & Footprints
         Documents, articles, and public posts found via search dorking.
         - **[URL]** — Type: [CV/Paper/Post] — Confidence: [X]% — [Analysis]
 
-        ## 3. Analyst's Assessment & Conclusion
+        ## 4. Analyst's Assessment & Conclusion
         - **Synthesis:** Coherent narrative about the target's digital persona.
         - **Inconsistencies:** Note any contradictions in the data.
-        - **Low-Confidence Items:** List anything under 70% confidence and why it needs manual review.
+        - **Low-Confidence Items:** List anything under 60% confidence and why it needs manual review.
         - **Actionable Intelligence:** Key takeaways.
         - **Next Steps:** Specific suggestions for deeper investigation.
     """
@@ -622,22 +804,25 @@ def osint(
             "Please provide at least a full name (and ideally a city)."
         )
 
-    candidate_urls = []
-    preconfirmed = []  # deterministic hits that skip AI verification (e.g. GitHub API)
+    merged_hits = {}
+    preconfirmed = []
+    methodology = []
 
     if target_username and social_analyzer_available:
         if progress_callback:
             progress_callback(f"Running social-analyzer for username: {target_username}...")
         social_results = run_social_analyzer(target_username)
+        methodology.append("social-analyzer (username scan)")
         if social_results and social_results.get("detected"):
-            for item in social_results["detected"]:
-                if item.get("link"):
-                    candidate_urls.append(item["link"])
+            extra_hits = [
+                {"url": item["link"], "title": "", "snippet": "", "engine": "social-analyzer", "query": target_username}
+                for item in social_results["detected"] if item.get("link")
+            ]
+            merged_hits.update(merge_search_hits(extra_hits))
     elif target_username and not social_analyzer_available and progress_callback:
         progress_callback("'social-analyzer' kurulu değil, bu adım atlanıyor...")
 
     if target_name:
-        # Deterministic username-guessing pass (works even with zero username given)
         guess_pool = [target_username] if target_username else []
         guess_pool += generate_username_candidates(target_name)
         guess_pool = list(dict.fromkeys(filter(None, guess_pool)))
@@ -645,6 +830,7 @@ def osint(
         if progress_callback:
             progress_callback(f"Olası kullanıcı adları deneniyor: {', '.join(guess_pool[:8])}...")
         preconfirmed = probe_username_candidates(guess_pool, progress_callback=progress_callback)
+        methodology.append("GitHub / Reddit / Keybase API (username-guess verification)")
 
         dork_queries = build_dork_queries(target_name, target_city, target_keywords)
         if progress_callback:
@@ -652,26 +838,36 @@ def osint(
                 f"Built {len(dork_queries)} search dorks for '{target_name}'"
                 + (f" in '{target_city}'" if target_city else "") + " (Google + Bing + DuckDuckGo)..."
             )
-        candidate_urls.extend(run_all_dorks(dork_queries, progress_callback=progress_callback))
+        dork_hits = run_all_dorks(dork_queries, progress_callback=progress_callback)
+        methodology.append("Google, Bing, and DuckDuckGo search dorking")
+        methodology.append("Wayback Machine archive fallback (for blocked/JS-walled pages)")
+        for key, entry in dork_hits.items():
+            if key in merged_hits:
+                existing = merged_hits[key]
+                if len(entry["title"]) > len(existing["title"]):
+                    existing["title"] = entry["title"]
+                if len(entry["snippet"]) > len(existing["snippet"]):
+                    existing["snippet"] = entry["snippet"]
+                existing["engines"] |= entry["engines"]
+            else:
+                merged_hits[key] = entry
 
-    unique_urls = dedupe_urls(candidate_urls)
-    # Don't re-verify URLs we already deterministically confirmed
     preconfirmed_urls = {normalize_url(p["url"]) for p in preconfirmed}
-    unique_urls = [u for u in unique_urls if normalize_url(u) not in preconfirmed_urls]
+    merged_hits = {k: v for k, v in merged_hits.items() if k not in preconfirmed_urls}
 
-    if not unique_urls and not preconfirmed:
+    if not merged_hits and not preconfirmed:
         return (
             "**Info:** No potential profiles or links found for the target. "
             "Try adding more details (city, profession, school) to the request."
         )
 
     verified_data = list(preconfirmed)
-    if unique_urls:
+    if merged_hits:
         if progress_callback:
-            progress_callback(f"Starting verification of {len(unique_urls)} URLs (parallel)...")
+            progress_callback(f"Starting verification of {len(merged_hits)} URLs (parallel)...")
         verified_data.extend(
             verify_urls_parallel(
-                unique_urls, model,
+                merged_hits, model,
                 target_name=target_name, city=target_city, keywords=target_keywords,
                 progress_callback=progress_callback,
             )
@@ -679,7 +875,7 @@ def osint(
 
     if not verified_data:
         return (
-            f"**Info:** {len(unique_urls)} potansiyel bağlantı bulundu ancak hiçbiri yeterli güvenle "
+            f"**Info:** {len(merged_hits)} potansiyel bağlantı bulundu ancak hiçbiri yeterli güvenle "
             "doğrulanamadı. Kişi bilgilerini biraz daha detaylandırmayı (meslek, okul, ilgi alanı) "
             "deneyebilirsin."
         )
@@ -690,7 +886,7 @@ def osint(
         progress_callback(f"Generating final intelligence report ({len(verified_data)} confirmed profiles)...")
 
     final_report = analyze_fused_data_with_ai(
-        user_input, verified_data, target_keywords, model, language_code
+        user_input, verified_data, target_keywords, model, language_code, methodology
     )
 
     try:

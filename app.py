@@ -24,10 +24,10 @@ _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ── Available Gemini models ──────────────────────────────────────────────────
 AVAILABLE_MODELS = [
-    ("gemini-2.0-flash",     "Gemini 2.0 Flash  (Recommended)"),
-    ("gemini-2.0-flash-exp", "Gemini 2.0 Flash Exp"),
-    ("gemini-1.5-pro",       "Gemini 1.5 Pro  (High Quality)"),
-    ("gemini-1.5-flash",     "Gemini 1.5 Flash"),
+    ("gemini-3.5-flash",     "Gemini 3.5 Flash  (Recommended)"),
+    ("gemini-3.1-flash-lite", "Gemini 3.1 Flash lite"),
+    ("gemini-2.5-flash",       "Gemini 2.5 Flash"),
+    ("gemini-2.5-flash-lite",     "Gemini 2.5 Flash lite"),
 ]
 
 # ── Backend options ───────────────────────────────────────────────────────────
