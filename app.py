@@ -16,7 +16,8 @@ from custom_widgets import SimpleSwitch
 from passgenai import passgen
 from osintai import osint
 from chatbot import Chatbot
-from utils import list_ollama_models, check_ollama_running, DEFAULT_OLLAMA_HOST
+from utils import (list_ollama_models, check_ollama_running, DEFAULT_OLLAMA_HOST,
+                   resolve_backend, pick_ollama_model)
 from dotenv import load_dotenv, set_key, find_dotenv
 
 # ── Paths ────────────────────────────────────────────────────────────────────
@@ -910,10 +911,13 @@ class MainWindow(QMainWindow):
 
         # Ollama host / model (model combo itself is populated by refresh_ollama_models)
         self.ollama_host_input.setText(os.getenv("OLLAMA_HOST", DEFAULT_OLLAMA_HOST))
-        self.current_ollama_model = os.getenv("OLLAMA_MODEL") or None
+        # Nothing chosen yet: take whatever Ollama already has, so a fresh
+        # install works without a trip to Settings.
+        self.current_ollama_model = (os.getenv("OLLAMA_MODEL")
+                                     or pick_ollama_model(self._current_ollama_host()))
 
-        # Backend
-        saved_backend = os.getenv("AI_BACKEND", "gemini").lower()
+        # Backend. Local unless the user asked for the cloud — resolve_backend().
+        saved_backend = resolve_backend()
         bidx = self.backend_combo.findData(saved_backend)
         if bidx == -1:
             bidx = 0
@@ -942,11 +946,47 @@ class MainWindow(QMainWindow):
     def _current_ollama_host(self) -> str:
         return self.ollama_host_input.text().strip() or DEFAULT_OLLAMA_HOST
 
+    def _warn_cloud_backend(self) -> None:
+        """Say plainly that the cloud backend sends what you type to Google.
+
+        Maze Linux ships this app on a distribution that promises nothing
+        leaves the machine by default. The cloud backend is a legitimate
+        choice, but it has to be an informed one, so the notice is shown the
+        first time it is selected and remembered afterwards.
+        """
+        try:
+            env_file = find_dotenv(usecwd=False) or os.path.join(_BASE_DIR, ".env")
+            load_dotenv(env_file)
+            if os.getenv("CLOUD_NOTICE_ACK") == "1":
+                return
+        except Exception:
+            env_file = None
+
+        lang = LANGUAGES[self.current_lang]
+        QMessageBox.warning(
+            self,
+            lang.get("cloud_notice_title", "Cloud backend selected"),
+            lang.get(
+                "cloud_notice_body",
+                "Gemini runs on Google's servers. Your prompts, and any file or "
+                "target details you include, are sent to Google and handled under "
+                "their terms.\n\n"
+                "The Ollama backend runs entirely on this machine and sends nothing.",
+            ),
+        )
+        if env_file:
+            try:
+                set_key(env_file, "CLOUD_NOTICE_ACK", "1")
+            except Exception:
+                pass
+
     def on_backend_changed(self, index: int):
         backend_id = self.backend_combo.itemData(index)
         if not backend_id:
             return
         self.current_backend = backend_id
+        if backend_id == "gemini":
+            self._warn_cloud_backend()
         self.model_stack.setCurrentIndex(0 if backend_id == "gemini" else 1)
         self._chatbot = None  # reset chatbot so it picks up the new backend
         try:
@@ -1154,6 +1194,7 @@ class MainWindow(QMainWindow):
             api_key = os.getenv("GOOGLE_API_KEY")
             if not api_key:
                 return None
+            self._warn_cloud_backend()
             self._chatbot = Chatbot(backend="gemini", api_key=api_key, model_name=self.current_model)
 
         # Show welcome on first init

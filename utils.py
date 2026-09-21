@@ -8,6 +8,8 @@ from google import genai as _genai
 from google.genai import types as _types
 
 DEFAULT_OLLAMA_HOST = "http://localhost:11434"
+# Matches Maze AI's default so the two apps share one pulled model.
+DEFAULT_OLLAMA_MODEL = "llama3.1"
 
 
 def get_base_dir() -> str:
@@ -104,27 +106,76 @@ def initialize_gemini(model_name: str = None) -> _GeminiModelWrapper:
     return _GeminiModelWrapper(client, model_name)
 
 
+def pick_ollama_model(host: str = None) -> str | None:
+    """The local model to use when the user has not named one.
+
+    Prefers the same model Maze AI defaults to, so a machine that already ran
+    Maze AI does not have to pull a second one. Falls back to whatever is
+    actually installed, and returns None only when Ollama has no models at all.
+    """
+    models = list_ollama_models(host)
+    if not models:
+        return None
+    for want in (DEFAULT_OLLAMA_MODEL, DEFAULT_OLLAMA_MODEL + ":latest"):
+        if want in models:
+            return want
+    # A tag-less preference still matches "llama3.1:8b" and friends.
+    for m in models:
+        if m.split(":", 1)[0] == DEFAULT_OLLAMA_MODEL:
+            return m
+    return models[0]
+
+
 def initialize_ollama(model_name: str = None, host: str = None) -> _OllamaModelWrapper:
     load_dotenv(os.path.join(get_base_dir(), ".env"))
     host = host or get_ollama_host()
-    model_name = model_name or os.getenv("OLLAMA_MODEL")
-    if not model_name:
-        raise ValueError("No Ollama model selected. Please choose one in Settings.")
     if not check_ollama_running(host):
         raise RuntimeError(
             f"Ollama service not reachable at {host}. Make sure `ollama serve` is running."
         )
+    model_name = model_name or os.getenv("OLLAMA_MODEL") or pick_ollama_model(host)
+    if not model_name:
+        raise ValueError(
+            "Ollama is running but has no models installed. "
+            f"Pull one first, e.g. `ollama pull {DEFAULT_OLLAMA_MODEL}`."
+        )
     return _OllamaModelWrapper(model_name, host)
+
+
+def resolve_backend(backend: str = None) -> str:
+    """Decide which backend to use when the caller does not name one.
+
+    Maze Linux ships this app on a distribution whose whole promise is that
+    nothing leaves the machine unless the user asks. So the local backend is
+    the default, and the cloud one is only chosen when the user has actually
+    configured it. The order is deliberate:
+
+      1. an explicit argument, then AI_BACKEND — the user said what they want
+      2. a reachable local Ollama — private, costs nothing, needs no account
+      3. a configured GOOGLE_API_KEY — an existing install keeps working
+      4. otherwise local, so the error message points at the private path
+    """
+    if backend:
+        return backend.lower()
+    load_dotenv(os.path.join(get_base_dir(), ".env"))
+    env = os.getenv("AI_BACKEND")
+    if env:
+        return env.lower()
+    if check_ollama_running():
+        return "ollama"
+    if os.getenv("GOOGLE_API_KEY"):
+        return "gemini"
+    return "ollama"
 
 
 def initialize_model(backend: str = None, model_name: str = None, host: str = None):
     """Backend-agnostic entry point used by passgenai/osintai/chatbot.
 
-    backend: "gemini" or "ollama". If omitted, falls back to the AI_BACKEND
-    env var (default "gemini"), so existing callers keep working unchanged.
+    backend: "gemini" or "ollama". If omitted, resolve_backend() picks one,
+    preferring the local service — see the note there.
     """
     load_dotenv(os.path.join(get_base_dir(), ".env"))
-    backend = (backend or os.getenv("AI_BACKEND", "gemini")).lower()
+    backend = resolve_backend(backend)
     if backend == "ollama":
         return initialize_ollama(model_name, host)
     return initialize_gemini(model_name)

@@ -1,18 +1,16 @@
 # Maintainer: berkkucukk <berkkucukk@proton.me>
 pkgname=sentinai
-pkgver=1.5.0
+pkgver=1.7.0
 pkgrel=1
 pkgdesc="AI-powered cybersecurity assistant with OSINT and password wordlist generation"
 arch=('any')
 url="https://github.com/berk-kucuk/SentinAI"
 license=('MIT')
+# Python libraries (PyQt6, google-genai, selenium, social-analyzer, …) come
+# from maze-python, the shared Maze venv at /opt/maze/venv.
 depends=(
-    'python'
-    'python-pyqt6'
+    'maze-python'
     'geckodriver'
-)
-makedepends=(
-    'python-virtualenv'
 )
 optdepends=(
     'firefox: web automation for OSINT profile verification'
@@ -31,20 +29,6 @@ sha256sums=(
     'SKIP'
 )
 
-build() {
-    # Isolated venv — system-site-packages only for PyQt6
-    python -m venv --system-site-packages "$srcdir/venv"
-    "$srcdir/venv/bin/pip" install \
-        --quiet \
-        --no-warn-conflicts \
-        google-genai \
-        python-dotenv \
-        beautifulsoup4 \
-        googlesearch-python \
-        selenium \
-        social-analyzer
-}
-
 package() {
     cd "$srcdir/SentinAI-$pkgver"
 
@@ -53,13 +37,6 @@ package() {
     install -dm755  "$pkgdir/opt/sentinai/icons"
     install -dm1777 "$pkgdir/opt/sentinai/osints"
     install -dm1777 "$pkgdir/opt/sentinai/wordlists"
-
-    # Venv — fix hardcoded build paths in scripts
-    cp -r "$srcdir/venv" "$pkgdir/opt/sentinai/.venv"
-    find "$pkgdir/opt/sentinai/.venv/bin" -maxdepth 1 -type f | while IFS= read -r f; do
-        head -c2 "$f" | grep -q '#!' && \
-            sed -i "1s|$srcdir/venv|/opt/sentinai/.venv|" "$f"
-    done
 
     # Python source files
     local _pyfiles=(app.py chatbot.py custom_widgets.py osintai.py passgenai.py utils.py)

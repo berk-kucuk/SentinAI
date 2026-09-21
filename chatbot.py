@@ -2,7 +2,8 @@ import requests
 from google import genai as _genai
 from google.genai import types as _types
 
-from utils import get_ollama_host, check_ollama_running
+from utils import (get_ollama_host, check_ollama_running, resolve_backend,
+                   pick_ollama_model)
 
 SYSTEM_INSTRUCTION = (
     "You are SentinAI, an expert cybersecurity assistant. "
@@ -23,25 +24,32 @@ class Chatbot:
 
     def __init__(
         self,
-        backend: str = "gemini",
+        backend: str = None,
         api_key: str = None,
         model_name: str = None,
         ollama_host: str = None,
         timeout: int = 300,
     ):
-        self.backend = (backend or "gemini").lower()
+        # No backend named means "pick the private one if you can" — see
+        # utils.resolve_backend().
+        self.backend = resolve_backend(backend)
         self._model_name = model_name
         self._timeout = timeout
 
         if self.backend == "ollama":
             self._ollama_host = (ollama_host or get_ollama_host()).rstrip("/")
-            if not model_name:
-                raise ValueError("No Ollama model selected. Please choose one in Settings.")
             if not check_ollama_running(self._ollama_host):
                 raise RuntimeError(
                     f"Ollama service not reachable at {self._ollama_host}. "
                     "Make sure `ollama serve` is running."
                 )
+            model_name = model_name or pick_ollama_model(self._ollama_host)
+            if not model_name:
+                raise ValueError(
+                    "Ollama is running but has no models installed. "
+                    "Pull one first, e.g. `ollama pull llama3.1`."
+                )
+            self._model_name = model_name
             self._messages = [{"role": "system", "content": SYSTEM_INSTRUCTION}]
         else:
             if not api_key:

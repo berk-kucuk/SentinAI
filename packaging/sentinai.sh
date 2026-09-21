@@ -23,5 +23,7 @@ ln -s "$CFG_DIR/.env"       "$WORK_DIR/.env"
 ln -s "$DATA_DIR/osints"    "$WORK_DIR/osints"
 ln -s "$DATA_DIR/wordlists" "$WORK_DIR/wordlists"
 
-export PATH="/opt/sentinai/.venv/bin:$PATH"
-exec /opt/sentinai/.venv/bin/python "$WORK_DIR/app.py" "$@"
+# The shared Maze Python environment (maze-python); its bin/ goes first on
+# PATH so selenium and friends find the interpreter they were installed for.
+export PATH="/opt/maze/venv/bin:$PATH"
+exec /opt/maze/venv/bin/python3 "$WORK_DIR/app.py" "$@"

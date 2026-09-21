@@ -211,3 +211,7 @@ osints/debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Packaged build artifacts
+dist-pkg/
+*.pkg.tar.*
