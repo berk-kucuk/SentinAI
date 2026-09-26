@@ -23,6 +23,28 @@ from dotenv import load_dotenv, set_key, find_dotenv
 # ── Paths ────────────────────────────────────────────────────────────────────
 _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+
+def _writable_env_file() -> str:
+    """The real .env to write settings into, private to its owner.
+
+    The packaged launcher (/usr/bin/sentinai) runs the app from a temporary
+    directory whose .env is a SYMLINK to ~/.config/sentinai/.env. python-dotenv's
+    set_key() rewrites a file by moving a temp file over the path it is given,
+    and a rename over a symlink replaces the LINK, not its target — so every
+    saved setting (API key, model, backend, the cloud-notice acknowledgement)
+    landed in the temp directory and was deleted when the app closed. Resolving
+    the link first writes the file that actually persists.
+
+    The file holds the Google API key, so it is kept at 0600.
+    """
+    path = os.path.realpath(find_dotenv(usecwd=False) or os.path.join(_BASE_DIR, ".env"))
+    try:
+        if os.path.exists(path):
+            os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return path
+
 # ── Available Gemini models ──────────────────────────────────────────────────
 AVAILABLE_MODELS = [
     ("gemini-3.5-flash",     "Gemini 3.5 Flash  (Recommended)"),
@@ -881,7 +903,7 @@ class MainWindow(QMainWindow):
             self.check_api_key_status()
             return
         try:
-            env_file = find_dotenv(usecwd=False) or os.path.join(_BASE_DIR, ".env")
+            env_file = _writable_env_file()
             set_key(env_file, "GOOGLE_API_KEY", api_key)
             self._chatbot = None  # reset chatbot so it picks up new key
             QMessageBox.information(self, lang["window_title"], lang["status_api_key_saved"])
@@ -934,7 +956,7 @@ class MainWindow(QMainWindow):
         self.current_model = model_id
         self._chatbot = None  # reset chatbot to use new model
         try:
-            env_file = find_dotenv(usecwd=False) or os.path.join(_BASE_DIR, ".env")
+            env_file = _writable_env_file()
             set_key(env_file, "GEMINI_MODEL", model_id)
         except Exception:
             pass
@@ -955,7 +977,7 @@ class MainWindow(QMainWindow):
         first time it is selected and remembered afterwards.
         """
         try:
-            env_file = find_dotenv(usecwd=False) or os.path.join(_BASE_DIR, ".env")
+            env_file = _writable_env_file()
             load_dotenv(env_file)
             if os.getenv("CLOUD_NOTICE_ACK") == "1":
                 return
@@ -990,7 +1012,7 @@ class MainWindow(QMainWindow):
         self.model_stack.setCurrentIndex(0 if backend_id == "gemini" else 1)
         self._chatbot = None  # reset chatbot so it picks up the new backend
         try:
-            env_file = find_dotenv(usecwd=False) or os.path.join(_BASE_DIR, ".env")
+            env_file = _writable_env_file()
             set_key(env_file, "AI_BACKEND", backend_id)
         except Exception:
             pass
@@ -1000,7 +1022,7 @@ class MainWindow(QMainWindow):
     def on_ollama_host_changed(self):
         host = self._current_ollama_host()
         try:
-            env_file = find_dotenv(usecwd=False) or os.path.join(_BASE_DIR, ".env")
+            env_file = _writable_env_file()
             set_key(env_file, "OLLAMA_HOST", host)
         except Exception:
             pass
@@ -1049,7 +1071,7 @@ class MainWindow(QMainWindow):
         self.current_ollama_model = model_id
         self._chatbot = None
         try:
-            env_file = find_dotenv(usecwd=False) or os.path.join(_BASE_DIR, ".env")
+            env_file = _writable_env_file()
             set_key(env_file, "OLLAMA_MODEL", model_id)
         except Exception:
             pass

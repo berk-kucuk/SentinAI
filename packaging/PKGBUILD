@@ -1,7 +1,7 @@
 # Maintainer: berkkucukk <berkkucukk@proton.me>
 pkgname=sentinai
 pkgver=1.7.0
-pkgrel=1
+pkgrel=2
 pkgdesc="AI-powered cybersecurity assistant with OSINT and password wordlist generation"
 arch=('any')
 url="https://github.com/berk-kucuk/SentinAI"

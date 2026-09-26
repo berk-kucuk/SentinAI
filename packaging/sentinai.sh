@@ -11,7 +11,8 @@ trap 'rm -rf "$WORK_DIR"' EXIT
 mkdir -p "$CFG_DIR" "$DATA_DIR/osints" "$DATA_DIR/wordlists"
 
 if [[ ! -f "$CFG_DIR/.env" ]]; then
-    cp "$APP_DIR/.env.example" "$CFG_DIR/.env"
+    # 0600 from the start: this file will hold the Google API key.
+    install -m600 "$APP_DIR/.env.example" "$CFG_DIR/.env"
     echo "[SentinAI] Config created at $CFG_DIR/.env — add your GOOGLE_API_KEY."
 fi
 
