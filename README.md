@@ -37,68 +37,74 @@ This project aims to provide a powerful and accessible toolkit for cybersecurity
 
 ## Installation
 
-Follow the steps below to run this project on your local machine.
+### From the Maze repository
 
-### 1\. Prerequisites
-
-  * **Python 3.8+**
-  * **Google Chrome** or **Firefox** browser (required for the profile verification feature in OSINT mode).
-  * **Git** (for cloning the repository).
-
-### 2\. Clone the Repository
-
-Open a terminal or command prompt and run the following command to clone the project:
+**On Maze Linux** the repository is already configured:
 
 ```bash
-git clone https://github.com/your-username/SentinAI.git
+sudo pacman -S sentinai
+```
+
+**On Arch Linux and Arch-based distributions**, add the repository once:
+
+1. Import and trust the Maze signing key:
+
+   ```bash
+   curl -O https://mazerepo.berkkucukk.com.tr/packages/mazelinux.gpg
+   gpg --show-keys --with-fingerprint mazelinux.gpg
+   sudo pacman-key --add mazelinux.gpg
+   sudo pacman-key --lsign-key 7C4D515A6B930CB04794CEF6147C8159B3E2EE5F
+   ```
+
+   The fingerprint `gpg` prints must be `7C4D 515A 6B93 0CB0 4794  CEF6 147C 8159 B3E2 EE5F`.
+
+2. Add the repository to the end of `/etc/pacman.conf`:
+
+   ```ini
+   [mazelinux]
+   SigLevel = Required DatabaseOptional
+   Server = https://mazerepo.berkkucukk.com.tr/packages
+   ```
+
+3. Sync and install:
+
+   ```bash
+   sudo pacman -Syu sentinai
+   ```
+
+Optionally install `mazelinux-keyring` as well; it keeps the signing key up to date through pacman.
+
+Remove with `sudo pacman -Rns sentinai`.
+
+### Build from source
+
+The package is built from this working tree by `build-pkg.sh` and installed with pacman, exactly like the published one:
+
+```bash
+sudo pacman -S --needed base-devel git
+git clone https://github.com/berk-kucuk/SentinAI.git
 cd SentinAI
+sudo pacman -S --needed $(bash -c 'source packaging/PKGBUILD; echo "${depends[@]}" "${makedepends[@]}"')
+./build-pkg.sh --install
 ```
 
-### 3\. Install Dependencies
+Without `--install` the package is only built, into `dist-pkg/`.
 
-Install the required Python libraries and tools.
+`maze-python` (the shared Python runtime) comes from the Maze repository, so add the repository first (steps 1–2 above).
 
-**a. Python Libraries:**
+### Configure the API key
 
-Install all libraries at once using the `requirements.txt` file in the project folder.
+The cloud features use Google Gemini, which needs an API key:
 
-```bash
-pip install -r requirements.txt
-```
+1. Go to [Google AI Studio](https://aistudio.google.com/app/apikey), sign in and create a key.
+2. Run `sentinai` once. It creates `~/.config/sentinai/.env` (mode `0600`).
+3. Put the key into that file:
 
-*If you don't have a `requirements.txt` file, you can install them manually with the following commands:*
+   ```
+   GOOGLE_API_KEY="YOUR_API_KEY"
+   ```
 
-```bash
-pip install PyQt6 google-generativeai python-dotenv googlesearch-python beautifulsoup4 selenium
-```
-
-**b. `social-analyzer` Installation:**
-
-This tool is used in OSINT mode to search for usernames across various social media platforms.
-
-```bash
-pip3 install social-analyzer
-```
-
-### 4\. Configure the API Key
-
-This project uses Google Gemini AI services, which require an API key.
-
-**a. Get an API Key:**
-
-  - Go to [Google AI Studio](https://aistudio.google.com/app/apikey).
-  - Sign in with your Google account and create a new API key.
-
-**b. Create a `.env` File:**
-
-  - In the project's root directory, create a new file named `.env`.
-  - Add the following line to the file, replacing `YOUR_API_KEY` with the key you obtained:
-
-<!-- end list -->
-
-```
-GOOGLE_API_KEY="YOUR_API_KEY"
-```
+The profile verification feature in OSINT mode also needs **Firefox** (driven through `geckodriver`, which the package pulls in).
 
 ## How to Use
 
